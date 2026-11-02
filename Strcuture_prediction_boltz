@@ -1,0 +1,87 @@
+##run of google colab##
+
+!pip install boltz[cuda] -U
+!pip install datasets pandas pyyaml
+##################################################################################################
+
+import os
+import yaml
+import pandas as pd
+from google.colab import drive
+
+# 1. Mount your Google Drive (you will get a pop-up to allow access)
+drive.mount('/content/drive')
+
+# 2. Define the Constants
+CYP3A4_SEQ = "MALIPDLAMETWLLLAVSLVLLYLYGTHSHGLFKKLGIPGPTPLPFLGNILSYHKGFCMFDMECHKKYGKVWGFYDGQQPVLAITDPDMIKTVLVKECYSVFTNRRPFGPVGFMKSAISIAEDEEWKRLRSLLSPTFTSGKLKEMVPIIAQYGDVLVRNLRREAETGKPVTLKDVFGAYSMDVITSTSFGVNIDSLNNPQDPFVENTKKLLRFDFLDPFFLSITVFPFLIPILEVLNICVFPREVTNFLRKSVKRMKESRLEDTQKHRVDFLQLMIDSQNSKETESHKALSDLELVAQSIIFIFAGYETTSSVLSFIMYELATHPDVQQKLQEEIDAVLPNKAPPTYDTVLQMEYLDMVVNETLRLFPIAMRLERVCKKDVEINGMFIPKGWVVMIPSYALHRDPKYWTEPEKFLPERFSKKNKDNIDPYIYTPFGSGPRNCIGMRFALMNMKLALIRVLQNFSFKPCKETQIPLKLSLGGLLQPEKPVVLKVESRDGTVSGA"
+HEME_SMILES = "CC1=C(C)C2=CC3=C(C=C)C(C)=C(N3[Fe]N2)C=C4C(C)=C(C=C)C(=N4)C=C5C(C)=C(CCC(O)=O)C(=N5)C=C1CCC(O)=O"
+
+# 3. Load the dataset from your Drive
+drive_path = "/content/drive/MyDrive/OpenADMET_Challenge/data/cyp-challenge-TEST.csv"
+df = pd.read_csv(drive_path)
+
+# 4. Create the YAML configurations
+os.makedirs("boltz_inputs", exist_ok=True)
+for idx, row in df.iterrows():
+    mol_name = row['Molecule_Name']
+    target_smiles = row['SMILES']
+
+    boltz_config = {
+        "version": 1,
+        "sequences": [
+            {"protein": {"id": "A", "sequence": CYP3A4_SEQ}},
+            {"ligand": {"id": "HEM", "smiles": HEME_SMILES}},
+            {"ligand": {"id": "LIG", "smiles": target_smiles}}
+        ]
+    }
+
+    with open(f"boltz_inputs/{mol_name}.yaml", 'w') as f:
+        yaml.dump(boltz_config, f, sort_keys=False)
+
+print(f"Successfully generated {len(df)} YAML files in 'boltz_inputs'.")
+##################################################################################################
+import os
+import yaml
+from datasets import load_dataset
+
+##################################################################################################
+!pip install boltz -U
+!python -m boltz predict boltz_inputs/ --out_dir boltz_outputs/ --use_msa_server --use_potentials
+##################################################################################################
+%%bash
+echo "Setting up Python 3.10 environment..."
+wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh -u -b -p /content/miniconda
+source /content/miniconda/etc/profile.d/conda.sh
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
+echo "Creating boltz_env..."
+conda create -n boltz_env python=3.10 -y
+echo "Installing Boltz..."
+/content/miniconda/envs/boltz_env/bin/pip install boltz -U
+echo "Starting Boltz Predictions..."
+/content/miniconda/envs/boltz_env/bin/boltz predict /content/boltz_inputs/ --out_dir /content/boltz_outputs/ --use_msa_server --use_potentials
+
+
+##################################################################################################
+import os
+import shutil
+import glob
+from google.colab import files
+
+print("Packaging results for submission...")
+os.makedirs("/content/final_submission", exist_ok=True)
+
+# Find all predicted CIF files from the bash run
+predicted_files = glob.glob("/content/boltz_outputs/**/predictions/*/*.cif", recursive=True)
+
+if not predicted_files:
+    print("Error: No .cif files found. Wait for the previous cell to finish.")
+else:
+    for file_path in predicted_files:
+        shutil.copy(file_path, "/content/final_submission/")
+
+    shutil.make_archive("OpenADMET_Structure_Predictions", 'zip', "/content/final_submission")
+    print(f"Successfully zipped {len(predicted_files)} files. Starting download...")
+    files.download("OpenADMET_Structure_Predictions.zip")
