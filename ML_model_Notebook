@@ -1,0 +1,244 @@
+####Run this is a google collab cell####
+
+!pip install -q rdkit lightgbm chemprop lightning pandas numpy scikit-learn
+
+import pandas as pd
+import numpy as np
+import torch
+from rdkit import Chem
+from rdkit.Chem import Descriptors, rdFingerprintGenerator, MACCSkeys
+import lightgbm as lgb
+from sklearn.model_selection import KFold
+import chemprop
+from chemprop import data, featurizers, models, nn
+from chemprop.nn import metrics
+import lightning.pytorch as pl
+import logging
+import warnings
+import os
+
+warnings.filterwarnings("ignore")
+logging.getLogger("lightning.pytorch").setLevel(logging.ERROR)
+
+print("--- OPENADMET CYP CHALLENGE: MASTER PIPELINE ---")
+
+# --- coonect G-drive ---
+from google.colab import drive
+drive.mount('/content/drive')
+
+PROJECT_DIR = '/content/drive/MyDrive/OpenADMET_Challenge'
+DATA_DIR = f'{PROJECT_DIR}/data'
+os.makedirs(DATA_DIR, exist_ok=True)
+os.chdir(DATA_DIR)
+
+# Download Data from Hugging Face
+TRAIN_INH_URL = "https://huggingface.co/datasets/openadmet/cyp-challenge-train-test/resolve/main/cyp-challenge-TRAIN_inhibition.csv"
+TRAIN_TDI_URL = "https://huggingface.co/datasets/openadmet/cyp-challenge-train-test/resolve/main/cyp-challenge-TRAIN_TDI.csv"
+TEST_URL = "https://huggingface.co/datasets/openadmet/cyp-challenge-train-test/resolve/main/cyp-challenge-TEST-BLINDED.csv"
+
+for file_name, url in [('cyp-challenge-TRAIN_inhibition.csv', TRAIN_INH_URL),
+                       ('cyp-challenge-TRAIN_TDI.csv', TRAIN_TDI_URL),
+                       ('cyp-challenge-TEST.csv', TEST_URL)]:
+    if not os.path.exists(file_name):
+        print(f"Downloading {file_name}...")
+        os.system(f"wget -q -O {file_name} {url}")
+
+df_train_inh = pd.read_csv('cyp-challenge-TRAIN_inhibition.csv')
+df_train_tdi = pd.read_csv('cyp-challenge-TRAIN_TDI.csv')
+df_test = pd.read_csv('cyp-challenge-TEST.csv')
+
+# compound identifiers for the final submission
+id_col = 'Molecule_Name' if 'Molecule_Name' in df_test.columns else df_test.columns[0]
+test_smiles = df_test['SMILES'].tolist()
+
+sub_inh = df_test[[id_col, 'SMILES']].copy()
+sub_tdi = df_test[[id_col, 'SMILES']].copy()
+
+# --- 2. FEATURE ENGINEERING ENGINE ---
+calc_desc = {n: f for n, f in Descriptors.descList}
+desc_names = list(calc_desc.keys())
+mfpgen_r2 = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+mfpgen_r3 = rdFingerprintGenerator.GetMorganGenerator(radius=3, fpSize=2048)
+
+def generate_kitchen_sink(smiles_list):
+    features = []
+    for smi in smiles_list:
+        mol = Chem.MolFromSmiles(smi)
+        if mol:
+            fp2 = mfpgen_r2.GetFingerprintAsNumPy(mol)
+            fp3 = mfpgen_r3.GetFingerprintAsNumPy(mol)
+            maccs = np.array(MACCSkeys.GenMACCSKeys(mol))
+            desc_vals = [calc_desc[name](mol) if not np.isnan(calc_desc[name](mol)) else 0.0 for name in desc_names]
+            features.append(np.concatenate([fp2, fp3, maccs, desc_vals]))
+        else:
+            features.append(np.zeros(2048 + 2048 + 167 + len(desc_names)))
+    return np.array(features)
+
+print("\nGenerating molecular features for Test Set (this takes a moment)...")
+X_test_full = generate_kitchen_sink(test_smiles)
+df_desc_test = pd.DataFrame([x[-len(desc_names):] for x in X_test_full], columns=desc_names)
+
+featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+
+# ==============================================================================
+# --- Regression Model ---
+# ==============================================================================
+print("\n=======================================================")
+print("=== PHASE 1: DIRECT INHIBITION REGRESSION PIPELINE ====")
+print("=======================================================")
+isoforms_inh = ['CYP1A2', 'CYP2C9', 'CYP2D6', 'CYP3A4']
+
+for iso in isoforms_inh:
+    print(f"\n--- INHIBITION: {iso} ---")
+    col_name = f"{iso}_pIC50_direct_inhibition"
+    df_iso = df_train_inh[['SMILES', col_name]].dropna().reset_index(drop=True)
+    train_smiles = df_iso['SMILES'].tolist()
+    y_train = df_iso[col_name].values
+
+    X_train_full = generate_kitchen_sink(train_smiles)
+    df_desc_train = pd.DataFrame([x[-len(desc_names):] for x in X_train_full], columns=desc_names)
+
+    correlations = df_desc_train.corrwith(pd.Series(y_train)).abs().sort_values(ascending=False)
+    top_10_names = correlations.head(10).index.tolist()
+
+    X_gnn_train = df_desc_train[top_10_names].values.astype(np.float32)
+    X_gnn_test = df_desc_test[top_10_names].values.astype(np.float32)
+
+    test_preds_lgb = np.zeros(len(test_smiles))
+    test_preds_gnn = np.zeros(len(test_smiles))
+
+    train_datapoints = [data.MoleculeDatapoint.from_smi(smi, np.array([tgt], dtype=np.float32), x_d=x) for smi, tgt, x in zip(train_smiles, y_train, X_gnn_train)]
+    test_datapoints = [data.MoleculeDatapoint.from_smi(smi, x_d=x) for smi, x in zip(test_smiles, X_gnn_test)]
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(train_smiles)):
+        print(f"Training Fold {fold + 1}/5...")
+        if iso != 'CYP3A4':
+            lgb_model = lgb.LGBMRegressor(n_estimators=1000, learning_rate=0.03, max_depth=7, num_leaves=31,
+                                          subsample=0.8, colsample_bytree=0.6, random_state=42, n_jobs=-1, verbose=-1)
+            lgb_model.fit(X_train_full[train_idx], y_train[train_idx], eval_set=[(X_train_full[val_idx], y_train[val_idx])],
+                          callbacks=[lgb.early_stopping(50, verbose=False)])
+            test_preds_lgb += lgb_model.predict(X_test_full) / 5.0
+
+        train_dset = data.MoleculeDataset([train_datapoints[i] for i in train_idx], featurizer)
+        val_dset = data.MoleculeDataset([train_datapoints[i] for i in val_idx], featurizer)
+        test_dset = data.MoleculeDataset(test_datapoints, featurizer)
+
+        tgt_scaler = train_dset.normalize_targets()
+        val_dset.normalize_targets(tgt_scaler)
+        feat_scaler = train_dset.normalize_inputs("X_d")
+        val_dset.normalize_inputs("X_d", feat_scaler)
+        test_dset.normalize_inputs("X_d", feat_scaler)
+
+        mp_layer = nn.BondMessagePassing()
+        mpnn = models.MPNN(message_passing=mp_layer, agg=nn.MeanAggregation(),
+                           predictor=nn.RegressionFFN(input_dim=mp_layer.output_dim + 10, dropout=0.2),
+                           metrics=[metrics.RMSE()])
+
+        trainer = pl.Trainer(max_epochs=60, enable_progress_bar=False, logger=False, accelerator="auto", devices=1)
+        trainer.fit(mpnn, data.build_dataloader(train_dset, num_workers=0), data.build_dataloader(val_dset, num_workers=0, shuffle=False))
+
+        fold_preds = torch.cat(trainer.predict(mpnn, data.build_dataloader(test_dset, num_workers=0, shuffle=False)))
+        test_preds_gnn += tgt_scaler.inverse_transform(fold_preds.cpu().numpy()).flatten() / 5.0
+
+    if iso == 'CYP3A4':
+        sub_inh[col_name] = test_preds_gnn
+    else:
+        sub_inh[col_name] = (test_preds_lgb + test_preds_gnn) / 2.0
+
+# Ensure the identifier column is strictly named 'Molecule_Name'
+sub_inh = sub_inh.rename(columns={id_col: 'Molecule_Name'})
+
+# Force the exact 6-column order required by the challenge
+required_inh_columns = [
+    'SMILES',
+    'Molecule_Name',
+    'CYP1A2_pIC50_direct_inhibition',
+    'CYP2C9_pIC50_direct_inhibition',
+    'CYP2D6_pIC50_direct_inhibition',
+    'CYP3A4_pIC50_direct_inhibition'
+]
+sub_inh = sub_inh[required_inh_columns]
+
+# Final safety net to guarantee no NaN or inf values
+sub_inh = sub_inh.replace([np.inf, -np.inf], np.nan)
+sub_inh = sub_inh.fillna(sub_inh.mean(numeric_only=True))
+
+inh_file = f"{PROJECT_DIR}/final_inhibition_submission.csv"
+sub_inh.to_csv(inh_file, index=False)
+
+
+# ==============================================================================
+# --- Classification Model---
+# ==============================================================================
+print("\n=======================================================")
+print("========= PHASE 2: TDI CLASSIFICATION PIPELINE ========")
+print("=======================================================")
+tdi_targets = {'CYP2D6': {'col': 'CYP2D6_is_TDI', 'w': 3.62}, 'CYP3A4': {'col': 'CYP3A4_is_TDI', 'w': 3.69}}
+
+for iso, conf in tdi_targets.items():
+    print(f"\n--- TDI: {iso} ---")
+    col_name, pos_w = conf['col'], conf['w']
+    df_iso = df_train_tdi[['SMILES', col_name]].dropna().reset_index(drop=True)
+    train_smiles = df_iso['SMILES'].tolist()
+    y_train = df_iso[col_name].values.astype(int)
+
+    X_train_full = generate_kitchen_sink(train_smiles)
+    df_desc_train = pd.DataFrame([x[-len(desc_names):] for x in X_train_full], columns=desc_names)
+
+    correlations = df_desc_train.corrwith(pd.Series(y_train)).abs().sort_values(ascending=False)
+    top_10_names = correlations.head(10).index.tolist()
+    X_gnn_train = df_desc_train[top_10_names].values.astype(np.float32)
+    X_gnn_test = df_desc_test[top_10_names].values.astype(np.float32)
+
+    test_preds_lgb_prob = np.zeros(len(test_smiles))
+    test_preds_gnn_prob = np.zeros(len(test_smiles))
+
+    train_datapoints = [data.MoleculeDatapoint.from_smi(smi, np.array([tgt], dtype=np.float32), x_d=x) for smi, tgt, x in zip(train_smiles, y_train, X_gnn_train)]
+    test_datapoints = [data.MoleculeDatapoint.from_smi(smi, x_d=x) for smi, x in zip(test_smiles, X_gnn_test)]
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(train_smiles)):
+        print(f"Training Fold {fold + 1}/5...")
+
+        lgb_model = lgb.LGBMClassifier(n_estimators=1000, learning_rate=0.03, max_depth=7, num_leaves=31,
+                                       subsample=0.8, colsample_bytree=0.6, class_weight={0: 1.0, 1: pos_w},
+                                       random_state=42, n_jobs=-1, verbose=-1)
+        lgb_model.fit(X_train_full[train_idx], y_train[train_idx], eval_set=[(X_train_full[val_idx], y_train[val_idx])],
+                      callbacks=[lgb.early_stopping(50, verbose=False)])
+        test_preds_lgb_prob += lgb_model.predict_proba(X_test_full)[:, 1] / 5.0
+
+        train_dset = data.MoleculeDataset([train_datapoints[i] for i in train_idx], featurizer)
+        val_dset = data.MoleculeDataset([train_datapoints[i] for i in val_idx], featurizer)
+        test_dset = data.MoleculeDataset(test_datapoints, featurizer)
+
+        feat_scaler = train_dset.normalize_inputs("X_d")
+        val_dset.normalize_inputs("X_d", feat_scaler)
+        test_dset.normalize_inputs("X_d", feat_scaler)
+
+        mp_layer = nn.BondMessagePassing()
+        mpnn = models.MPNN(message_passing=mp_layer, agg=nn.MeanAggregation(),
+                           predictor=nn.BinaryClassificationFFN(input_dim=mp_layer.output_dim + 10, dropout=0.2),
+                           metrics=[metrics.BinaryAUROC()])
+
+        trainer = pl.Trainer(max_epochs=60, enable_progress_bar=False, logger=False, accelerator="auto", devices=1)
+        trainer.fit(mpnn, data.build_dataloader(train_dset, num_workers=0), data.build_dataloader(val_dset, num_workers=0, shuffle=False))
+
+        fold_preds = torch.cat(trainer.predict(mpnn, data.build_dataloader(test_dset, num_workers=0, shuffle=False)))
+        test_preds_gnn_prob += fold_preds.cpu().numpy().flatten() / 5.0
+
+    blended_probs = (test_preds_lgb_prob + test_preds_gnn_prob) / 2.0
+    sub_tdi[col_name] = (blended_probs >= 0.5).astype(int)
+
+# Formatting the TDI classification output
+sub_tdi = sub_tdi.rename(columns={id_col: 'Molecule_Name'})
+required_tdi_columns = ['SMILES', 'Molecule_Name', 'CYP2D6_is_TDI', 'CYP3A4_is_TDI']
+sub_tdi = sub_tdi[required_tdi_columns]
+sub_tdi = sub_tdi.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+tdi_file = f"{PROJECT_DIR}/final_tdi_submission.csv"
+sub_tdi.to_csv(tdi_file, index=False)
+
+print("\n=======================================================")
+print(f"COMPLETE! Submissions saved in exact platform format:")
+print(f"Regression: {inh_file}")
+print(f"Classification: {tdi_file}")
